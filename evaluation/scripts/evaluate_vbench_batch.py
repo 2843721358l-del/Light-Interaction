@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 Anonymous Authors.
+# Licensed under the MIT License.
+# See the LICENSE file in the repository root for details.
+"""VBench batch evaluation for Light Interaction generated videos."""
+
+import argparse
+import gc
+import json
+import os
+import shutil
+import tempfile
+import time
+import warnings
+from pathlib import Path
+
+os.environ.setdefault(
+    "MPLCONFIGDIR", os.path.join(tempfile.gettempdir(), "light-interaction-matplotlib")
+)
+warnings.filterwarnings("ignore", message="pkg_resources is deprecated as an API.*")
+warnings.filterwarnings("ignore", message="Importing from timm.models.layers is deprecated.*")
+warnings.filterwarnings("ignore", message="You are using `torch.load` with `weights_only=False`.*")
+
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
+from vbench import VBench
+
+
+DEFAULT_DIMENSIONS = [
+    "subject_consistency",
+    "background_consistency",
+    "motion_smoothness",
+    "aesthetic_quality",
+    "imaging_quality",
+]
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--prompt-json", default="evaluation/data/refined_prompts_llava16.json")
+    parser.add_argument("--video-dir", required=True)
+    parser.add_argument("--output-csv", required=True)
+    parser.add_argument("--sandbox-root", default=None)
+    parser.add_argument("--device", default="auto", help="auto, cuda, cuda:0, or cpu")
+    parser.add_argument("--dimensions", nargs="*", default=DEFAULT_DIMENSIONS)
+    return parser.parse_args()
+
+
+def resolve_device(device):
+    if device == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        print(f"[warn] requested {device}, but CUDA is not available; falling back to CPU.")
+        return "cpu"
+    return device
+
+
+def load_prompt_map(path):
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    return {Path(item["filename"]).stem: item["refined_prompt"] for item in data}
+
+
+def find_video(root, base_name):
+    root = Path(root)
+    candidates = [
+        root / base_name / "gen.mp4",
+        root / base_name.replace(" ", "_") / "gen.mp4",
+        root / f"{base_name}.mp4",
+        root / f"{base_name.replace(' ', '_')}.mp4",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def read_score(result_path, dimensions):
+    if not result_path.exists():
+        return {dim: None for dim in dimensions}
+    with open(result_path, encoding="utf-8") as f:
+        data = json.load(f)
+    row = {}
+    for dim in dimensions:
+        value = data.get(dim) if isinstance(data, dict) else None
+        if isinstance(value, list):
+            value = value[0]
+        row[dim] = value
+    return row
+
+
+def evaluate_one(video_path, prompt, name, sandbox_root, dimensions, device):
+    sandbox = sandbox_root / name.replace(" ", "_")
+    sandbox.mkdir(parents=True, exist_ok=True)
+    try:
+        input_video = sandbox / "input.mp4"
+        shutil.copy(video_path, input_video)
+
+        info_path = sandbox / "info.json"
+        metadata = [{
+            "video_list": [input_video.name],
+            "prompt_en": prompt,
+            "dimension": dimensions,
+        }]
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f)
+
+        bench = VBench(device=device, full_info_dir=str(info_path), output_path=str(sandbox))
+        bench.evaluate(
+            videos_path=str(sandbox),
+            name="vbench",
+            dimension_list=dimensions,
+            mode="custom_input",
+        )
+        scores = read_score(sandbox / "vbench_eval_results.json", dimensions)
+        del bench
+        gc.collect()
+        torch.cuda.empty_cache()
+        return scores
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
+
+
+def main():
+    args = parse_args()
+    device = resolve_device(args.device)
+    prompt_map = load_prompt_map(args.prompt_json)
+    sandbox_root = Path(args.sandbox_root or f"vbench_sandbox_{int(time.time())}")
+    sandbox_root.mkdir(parents=True, exist_ok=True)
+    Path(args.output_csv).parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    missing = 0
+    failed = 0
+    for base_name, prompt in tqdm(sorted(prompt_map.items()), desc="VBench"):
+        video_path = find_video(args.video_dir, base_name)
+        if not video_path:
+            missing += 1
+            continue
+        try:
+            scores = evaluate_one(video_path, prompt, base_name, sandbox_root, args.dimensions, device)
+        except Exception as exc:
+            print(f"[warn] VBench failed for {base_name}: {exc}")
+            scores = {dim: np.nan for dim in args.dimensions}
+            failed += 1
+        row = {"Video Name": base_name, **scores}
+        valid = [v for v in scores.values() if pd.notna(v)]
+        row["Video_Avg"] = float(np.mean(valid)) if valid else np.nan
+        rows.append(row)
+
+    if rows:
+        df = pd.DataFrame(rows)
+        avg = {"Video Name": "--- TOTAL AVERAGE ---"}
+        for col in [c for c in df.columns if c != "Video Name"]:
+            avg[col] = df[col].mean()
+        pd.concat([df, pd.DataFrame([avg])], ignore_index=True).to_csv(args.output_csv, index=False)
+    else:
+        print("[warn] no VBench rows were produced; CSV was not written.")
+
+    shutil.rmtree(sandbox_root, ignore_errors=True)
+    print(f"[vbench] wrote {len(rows)} rows; missing videos: {missing}; failed evaluations: {failed}")
+
+
+if __name__ == "__main__":
+    main()
